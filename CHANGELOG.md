@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-06
+
 ### Added
 
 - `send!` returns a future of where the record was stored, a map of `:topic`, `:partition`, `:offset` and `:timestamp`, and logs a
@@ -48,5 +50,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 First release: the `:components/kafka-producer` Integrant component, and `send!`, `send-sync!` and `send-batch!`.
 
-[Unreleased]: https://github.com/AF2B/borba-kafka-producer-component/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/AF2B/borba-kafka-producer-component/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/AF2B/borba-kafka-producer-component/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/AF2B/borba-kafka-producer-component/releases/tag/v1.0.0
