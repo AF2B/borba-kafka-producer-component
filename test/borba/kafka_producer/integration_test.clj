@@ -249,6 +249,17 @@
   (or (System/getenv "SCHEMA_REGISTRY_URL")
       (str "mock://borba-it-" (random-uuid))))
 
+(defn- read-record
+  "Returns the magic byte of a record and its value, read with the registry."
+  [^KafkaJsonSchemaDeserializer deserializer
+   topic
+   ^ConsumerRecord kafka-record]
+  (let [raw   ^bytes (.value kafka-record)
+        value (.deserialize deserializer ^String topic raw)]
+    {:magic (aget raw 0)
+     :value (jsonista/read-value (jsonista/write-value-as-string value)
+                                 jsonista/keyword-keys-object-mapper)}))
+
 (defn- consume-values
   "Reads the values of the partition 0 of a topic from its start, as the
    deserializer of Confluent reads them with the registry, until there are as
@@ -272,15 +283,7 @@
                   (> (System/currentTimeMillis) deadline))
             values
             (recur (into values
-                         (map (fn [^ConsumerRecord kafka-record]
-                                (let [raw ^bytes (.value kafka-record)]
-                                  {:magic (aget raw 0)
-                                   :value (jsonista/read-value
-                                           (jsonista/write-value-as-string
-                                            (.deserialize deserializer
-                                                          topic
-                                                          raw))
-                                           jsonista/keyword-keys-object-mapper)})))
+                         (map #(read-record deserializer topic %))
                          (.poll consumer (Duration/ofMillis poll-ms))))))))))
 
 (deftest schema-registry-test
