@@ -5,19 +5,26 @@
      docker run --rm -d --name borba-kafka-it -p 127.0.0.1:9092:9092 \\
        apache/kafka:4.0.0
 
-   and points the tests at with KAFKA_BROKERS (127.0.0.1:9092)."
+   and points the tests at with KAFKA_BROKERS (127.0.0.1:9092).
+
+   The Schema Registry tests use SCHEMA_REGISTRY_URL when it is set, a real
+   registry on that Kafka, and the mock registry of Confluent otherwise, so
+   the wire format is written to and read from a real Kafka either way."
   (:require
    [borba.kafka-producer :as kafka]
    [clojure.test :refer [deftest is testing]]
-   [integrant.core :as ig])
+   [integrant.core :as ig]
+   [jsonista.core :as jsonista])
   (:import
+   (io.confluent.kafka.serializers.json KafkaJsonSchemaDeserializer)
    (java.nio.charset StandardCharsets)
    (java.time Duration)
    (org.apache.kafka.clients.consumer
     ConsumerConfig ConsumerRecord KafkaConsumer)
    (org.apache.kafka.common TopicPartition)
    (org.apache.kafka.common.header Header)
-   (org.apache.kafka.common.serialization StringDeserializer)))
+   (org.apache.kafka.common.serialization
+    ByteArrayDeserializer StringDeserializer)))
 
 (set! *warn-on-reflection* true)
 
@@ -228,3 +235,92 @@
         (is (< (/ (- (System/nanoTime) started) 1e6) 5000))
         (finally
           (ig/halt! system))))))
+
+;; Schema Registry
+
+(def ^:private order-schema
+  {:type                 "object"
+   :properties           {:total {:type "number"}}
+   :required             ["total"]
+   :additionalProperties false})
+
+(defn- registry-url
+  []
+  (or (System/getenv "SCHEMA_REGISTRY_URL")
+      (str "mock://borba-it-" (random-uuid))))
+
+(defn- read-record
+  "Returns the magic byte of a record and its value, read with the registry."
+  [^KafkaJsonSchemaDeserializer deserializer
+   topic
+   ^ConsumerRecord kafka-record]
+  (let [raw   ^bytes (.value kafka-record)
+        value (.deserialize deserializer ^String topic raw)]
+    {:magic (aget raw 0)
+     :value (jsonista/read-value (jsonista/write-value-as-string value)
+                                 jsonista/keyword-keys-object-mapper)}))
+
+(defn- consume-values
+  "Reads the values of the partition 0 of a topic from its start, as the
+   deserializer of Confluent reads them with the registry, until there are as
+   many as asked for or the time is out."
+  [topic
+   url
+   expected]
+  (let [properties   (assoc (consumer-properties)
+                            ConsumerConfig/VALUE_DESERIALIZER_CLASS_CONFIG
+                            (.getName ByteArrayDeserializer))
+        deserializer (doto (KafkaJsonSchemaDeserializer.)
+                       (.configure {"schema.registry.url" url} false))]
+    (with-open [consumer (KafkaConsumer. ^java.util.Map properties)]
+      (let [topic-partition (TopicPartition. topic 0)
+            deadline        (+ (System/currentTimeMillis)
+                               (* wait-seconds 1000))]
+        (.assign consumer [topic-partition])
+        (.seekToBeginning consumer [topic-partition])
+        (loop [values []]
+          (if (or (>= (count values) expected)
+                  (> (System/currentTimeMillis) deadline))
+            values
+            (recur (into values
+                         (map #(read-record deserializer topic %))
+                         (.poll consumer (Duration/ofMillis poll-ms))))))))))
+
+(deftest schema-registry-test
+  (let [url      (registry-url)
+        topic    (topic-name "schema")
+        registry {:url       url
+                  :schemas   {topic order-schema}
+                  :register? true}
+        system   (start {:schema-registry registry})
+        producer (producer-of system)]
+    (try
+      (testing "writes the value in the wire format, with the id of its schema"
+        (kafka/send-sync! producer topic "order-1" {:total 10})
+        (is (= [{:magic 0 :value {:total 10}}]
+               (consume-values topic url 1))))
+
+      (testing "refuses a value that its schema does not allow, before sending"
+        (let [failure (try (kafka/send-sync! producer topic "order-2"
+                                             {:total "ten"})
+                           (catch Exception e e))]
+          (is (= :schema-violation (:error (kafka/error-data failure))))))
+
+      (testing "a topic without a schema cannot be written to"
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (kafka/send! producer (topic-name "other") "k" {:a 1}))))
+
+      (testing "a second start finds the schema it registered"
+        (let [again (start {:schema-registry (dissoc registry :register?)})]
+          (is (some? (:schemas (producer-of again))))
+          (ig/halt! again)))
+      (finally
+        (ig/halt! system))))
+
+  (testing "a schema that is not registered fails the start"
+    (let [failure (try (start {:schema-registry
+                               {:url     (registry-url)
+                                :schemas {(topic-name "none") order-schema}}})
+                       (catch clojure.lang.ExceptionInfo e e))]
+      (is (= :borba.kafka-producer.schema-registry/schema-not-registered
+             (:error (ex-data (ex-cause failure))))))))

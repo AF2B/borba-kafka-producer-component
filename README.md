@@ -11,11 +11,17 @@ bounded, and the producer closes cleanly.
 ```clojure
 io.github.af2b/borba-kafka-producer-component
 {:git/url "https://github.com/AF2B/borba-kafka-producer-component"
- :git/tag "v2.0.0"
+ :git/tag "v2.1.0"
  :git/sha "<the commit of the tag, printed in the release notes>"}
 ```
 
-It depends on Clojure, Integrant, `tools.logging`, [jsonista](https://github.com/metosin/jsonista) and the Apache Kafka client 4.3.1.
+It depends on Clojure, Integrant, `tools.logging`, [jsonista](https://github.com/metosin/jsonista), the Apache Kafka client 4.3.1 and
+the JSON Schema serializer of Confluent 8.3.2, which comes from the Maven repository of Confluent, so a project that depends on the
+component adds it:
+
+```clojure
+:mvn/repos {"confluent" {:url "https://packages.confluent.io/maven/"}}
+```
 
 ## Use
 
@@ -75,6 +81,49 @@ The value of the component is the producer that every function takes first.
              "sasl.jaas.config"  #env KAFKA_JAAS_CONFIG}
 ```
 
+## The Schema Registry
+
+Without `:schema-registry` a value is JSON text, and what a consumer gets is whatever the producer wrote. With it, each topic has a
+JSON Schema that a [Schema Registry](https://docs.confluent.io/platform/current/schema-registry/) holds, every value is checked against
+it before it is sent, and it is written in the wire format of Confluent: a magic byte, the id of the schema, then the JSON.
+
+```clojure
+:components/kafka-producer
+{:bootstrap-servers #env KAFKA_BROKERS
+ :schema-registry   {:url       #env SCHEMA_REGISTRY_URL
+                     :schemas   {"order-events"
+                                 {:type                 "object"
+                                  :properties           {:event-type {:type "string"}
+                                                         :data       {:type "object"}}
+                                  :required             ["event-type" "data"]
+                                  :additionalProperties false}}
+                     :register? false}}
+```
+
+| Option | What it is | Default |
+|---|---|---|
+| `:url` | The URL of the registry | required |
+| `:schemas` | A map from each topic to its JSON Schema, as data or as text | required |
+| `:register?` | Whether the start registers the schemas; otherwise it checks that they are registered | `false` |
+| `:basic-auth` | The credentials, `"user:password"` | none |
+| `:timeout-ms` | How long a request to the registry waits to connect and to be answered | `5000` |
+
+The schemas are the contract, so they reach the registry on purpose and never by the serializer, which is told not to register. A
+service that registers them itself, as a laptop or a test does, sets `:register? true`, and the registry refuses a schema that is not
+compatible with the versions before it. Elsewhere the start checks that each schema is registered under the subject of its topic
+(`<topic>-value`), so a deploy cannot change a contract by itself. A topic without a schema cannot be written to. The start fails,
+naming the topic, for each case:
+
+| `:error` | When |
+|---|---|
+| `::schema-registry/invalid-schema` | A schema is not a JSON Schema |
+| `::schema-registry/schema-not-registered` | A schema is not registered, and `:register?` is false |
+| `::schema-registry/incompatible-schema` | The registry refused to register a schema that breaks the versions before it |
+| `::schema-registry/cannot-connect` | The registry does not answer (`:address` without the credentials) |
+
+A consumer reads these values with the same registry, as `borba-kafka-consumer-component` does with its own `:schema-registry`; one
+that reads JSON text gets a value that is not JSON.
+
 ## What a delivery means
 
 The producer is written with `acks=all` and idempotence: a message is stored once the in-sync replicas have it, and a retry is not a
@@ -98,6 +147,9 @@ nobody waits for is not lost: it is logged, with the topic and the kind of failu
 | `:not-authorized` | The producer may not write to the topic |
 | `:authentication-failed` | The credentials are not accepted |
 | `:broker-unavailable` | The brokers cannot be reached |
+| `:schema-violation` | The schema of the topic refuses the value, which was not sent |
+| `:schema-not-registered` | The registry does not have the schema of the topic |
+| `:schema-registry-unavailable` | The registry does not answer |
 | `:serialization-failed` | The message could not be written |
 | `:kafka-error` | Any other failure of the client |
 
@@ -148,6 +200,7 @@ is dropped. A producer that is closed sends no more, and `send!` throws.
 | `error-data` | The failure of a Kafka exception, as data |
 | `borba.kafka-producer.config` | The checked options, turned into the properties of the client |
 | `borba.kafka-producer.errors` | The classification of the failures |
+| `borba.kafka-producer.schema-registry` | The schemas of the topics, checked against the registry, and the envelope a value is sent in |
 | `:components/kafka-producer` | The Integrant key that starts and closes the producer |
 
 ## Tests
@@ -161,6 +214,19 @@ docker run --rm -d --name borba-kafka-it -p 127.0.0.1:9092:9092 apache/kafka:4.0
 KAFKA_BROKERS=127.0.0.1:9092 make test-integration
 ```
 
+The Schema Registry tests use the mock registry of Confluent, in the unit suite and against the real Kafka of the integration suite.
+To run them against a real registry too:
+
+```bash
+docker run --rm -d --name borba-registry-it --network host \
+  -e SCHEMA_REGISTRY_HOST_NAME=localhost \
+  -e SCHEMA_REGISTRY_LISTENERS=http://127.0.0.1:8081 \
+  -e SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS=PLAINTEXT://127.0.0.1:9092 \
+  confluentinc/cp-schema-registry:8.0.0
+
+KAFKA_BROKERS=127.0.0.1:9092 SCHEMA_REGISTRY_URL=http://127.0.0.1:8081 make test-integration
+```
+
 It covers a message stored and read back with its key, value and headers, a tombstone, the order of a key, a record that is too large,
 a batch with a failure in the middle, the four compression codecs, a producer that is closed, and brokers that do not answer, at the
 start and at a send.
@@ -170,8 +236,10 @@ start and at a send.
 - **A lost message is the failure to design out.** The delivery settings are fixed and strict, and a failure comes back to the caller
   or to the log, never to nowhere.
 - **A bounded wait is a decision.** An unbounded one is the same as a decision to hang, made by whoever wrote the default.
-- **The Confluent serializers are gone.** The component sends JSON as text, and the Avro serializer, the schema registry client and the
-  repository they came from were not used.
+- **A contract is registered on purpose.** The serializer never registers a schema, so the version of a contract changes when someone
+  registers it, and a deploy that disagrees with it fails at the start instead of writing what nobody can read.
+- **JSON Schema, not Avro.** The value stays JSON and the schema is data in the configuration, so nothing is generated and the REPL
+  sees the same maps the topic holds.
 
 ## Development
 
