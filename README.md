@@ -11,7 +11,7 @@ bounded, and the producer closes cleanly.
 ```clojure
 io.github.af2b/borba-kafka-producer-component
 {:git/url "https://github.com/AF2B/borba-kafka-producer-component"
- :git/tag "v2.0.0"
+ :git/tag "v2.1.0"
  :git/sha "<the commit of the tag, printed in the release notes>"}
 ```
 
