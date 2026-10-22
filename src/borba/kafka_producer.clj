@@ -21,10 +21,16 @@
    its JSON; a nil value is a tombstone, which is how a compacted topic
    forgets a key.
 
+   With :schema-registry, each topic has a JSON Schema that the registry
+   holds, every value is checked against it before it is sent, and it is
+   written in the wire format of Confluent: see
+   borba.kafka-producer.schema-registry.
+
    Every wait is bounded: see borba.kafka-producer.config."
   (:require
    [borba.kafka-producer.config :as config]
    [borba.kafka-producer.errors :as errors]
+   [borba.kafka-producer.schema-registry :as schema-registry]
    [clojure.string :as str]
    [clojure.tools.logging :as log]
    [integrant.core :as ig]
@@ -63,7 +69,8 @@
             TimeUnit/MILLISECONDS))))
 
 (defmethod ig/init-key :components/kafka-producer
-  [_ {:keys [close-timeout-ms verify-connection? verify-timeout-ms]
+  [_ {:keys [close-timeout-ms verify-connection? verify-timeout-ms
+             schema-registry]
       :or   {close-timeout-ms     config/default-close-timeout-ms
              verify-connection?   true
              verify-timeout-ms    default-verify-timeout-ms}
@@ -79,16 +86,24 @@
                              {:error   ::cannot-connect
                               :brokers brokers}
                              cause)))))
-    (log/infof "kafka producer %s started on %s" client-id brokers)
-    {:producer         (KafkaProducer. ^java.util.Map properties)
-     :close-timeout-ms close-timeout-ms
-     :client-id        client-id}))
+    (let [registry (some-> schema-registry schema-registry/start!)]
+      (when registry
+        (log/infof "kafka producer %s writes %s with their schemas"
+                   client-id
+                   (sort (keys (:schemas registry)))))
+      (log/infof "kafka producer %s started on %s" client-id brokers)
+      {:producer         (KafkaProducer. ^java.util.Map properties)
+       :close-timeout-ms close-timeout-ms
+       :client-id        client-id
+       :schemas          (:schemas registry)
+       :registry         registry})))
 
 (defmethod ig/halt-key! :components/kafka-producer
-  [_ {:keys [^Producer producer close-timeout-ms client-id]}]
+  [_ {:keys [^Producer producer close-timeout-ms client-id registry]}]
   (when producer
     (.close producer (Duration/ofMillis close-timeout-ms))
-    (log/infof "kafka producer %s stopped" client-id)))
+    (log/infof "kafka producer %s stopped" client-id))
+  (schema-registry/stop! registry))
 
 ;; Sending
 
@@ -116,9 +131,22 @@
           ^String (name header-name)
           (.getBytes ^String (str header-value) StandardCharsets/UTF_8))))
 
+(defn- record-value
+  "Returns what the serializer is given for a value: its JSON text, or, with a
+   Schema Registry, the value wrapped with the schema of its topic. nil stays
+   nil, a tombstone."
+  [schemas
+   topic
+   value]
+  (cond
+    (nil? value) nil
+    schemas      (schema-registry/envelope schemas topic value)
+    :else        (jsonista/write-value-as-string value)))
+
 (defn- message-record
   "Returns the record of a message."
-  [topic
+  [producer
+   topic
    message-key
    value
    {:keys [headers] partition-number :partition}]
@@ -126,9 +154,9 @@
   (let [kafka-record (ProducerRecord. ^String topic
                                       ^Integer (some-> partition-number int)
                                       ^String (some-> message-key str)
-                                      ^String (when (some? value)
-                                                (jsonista/write-value-as-string
-                                                 value)))]
+                                      ^Object (record-value (:schemas producer)
+                                                            topic
+                                                            value))]
     (add-headers! (.headers kafka-record) headers)
     kafka-record))
 
@@ -157,7 +185,7 @@
    (let [^Producer kafka-producer (:producer producer)
          result                   (CompletableFuture.)]
      (.send kafka-producer
-            (message-record topic message-key value opts)
+            (message-record producer topic message-key value opts)
             (reify Callback
               (onCompletion [_ metadata exception]
                 (if exception

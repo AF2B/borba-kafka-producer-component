@@ -7,6 +7,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `:schema-registry`, which gives each topic a JSON Schema held by a Schema Registry. Every value is validated against the schema of
+  its topic before it is sent, and written in the wire format of Confluent. The start registers the schemas with `:register? true`,
+  or checks that they are registered, and fails naming the topic when a schema is not valid, not registered or not compatible, or
+  when the registry does not answer. A topic without a schema cannot be written to. Without the option nothing changes: the values
+  are JSON text.
+- `error-data` tells `:schema-violation`, `:schema-not-registered` and `:schema-registry-unavailable` apart from
+  `:serialization-failed`.
+- The JSON Schema serializer of Confluent 8.3.2, from the Maven repository of Confluent.
+
 ## [2.0.0] - 2026-10-06
 
 ### Added

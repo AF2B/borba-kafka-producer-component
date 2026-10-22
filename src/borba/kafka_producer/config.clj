@@ -8,6 +8,7 @@
    two minutes to deliver a message unless told otherwise, which for a service
    that answers requests is the same as not answering."
   (:require
+   [borba.kafka-producer.schema-registry :as schema-registry]
    [clojure.string :as str])
   (:import
    (org.apache.kafka.clients.producer ProducerConfig)
@@ -94,11 +95,14 @@
      30000)
    - request-timeout-ms: how long a request waits for a broker, which cannot be
      more than the delivery timeout (default 10000)
+   - schema-registry: the Schema Registry, which makes the values JSON Schema
+     in the wire format of Confluent, see borba.kafka-producer.schema-registry
+     (default none: the values are JSON text)
    - properties: more properties of the client, a map of strings to strings,
      such as the security protocol and the SASL settings, which take the
      place of the ones above (default none)"
   [{:keys [bootstrap-servers client-id linger-ms compression-type max-block-ms
-           delivery-timeout-ms request-timeout-ms properties]
+           delivery-timeout-ms request-timeout-ms schema-registry properties]
     :or   {client-id           default-client-id
            linger-ms           default-linger-ms
            compression-type    default-compression-type
@@ -130,6 +134,8 @@
                        (every? string? (vals properties))))
       (throw (invalid-option :properties properties
                              "a map of strings to strings")))
+    (when schema-registry
+      (schema-registry/check-options schema-registry))
     (merge {ProducerConfig/BOOTSTRAP_SERVERS_CONFIG      brokers
             ProducerConfig/CLIENT_ID_CONFIG              client-id
             ProducerConfig/KEY_SERIALIZER_CLASS_CONFIG
@@ -145,4 +151,5 @@
             (int delivery-timeout-ms)
             ProducerConfig/REQUEST_TIMEOUT_MS_CONFIG
             (int request-timeout-ms)}
+           (some-> schema-registry schema-registry/serializer-properties)
            properties)))
